@@ -1,46 +1,60 @@
 # syntax=docker/dockerfile:1
 FROM public.ecr.aws/lambda/nodejs:22
 
-RUN dnf install -y git gcc gcc-c++ cpp cpio make cmake automake autoconf chkconfig clang clang-libs dos2unix zlib zlib-devel zip unzip tar perl libxml2 bzip2 bzip2-libs xz xz-libs pkgconfig libtool
+############################
+# 1) Install build deps   #
+############################
+RUN dnf install -y \
+    git \
+    gcc gcc-c++ make cmake pkgconfig \
+    automake autoconf \
+    libtool libtool-ltdl-devel \
+    libjpeg-turbo-devel \
+    libpng-devel \
+    libwebp-devel \
+    openjpeg2-devel \
+    libtiff-devel \
+    lcms2-devel \
+    libxml2-devel \
+    zlib-devel \
+    xz xz-libs \
+    bzip2 bzip2-libs \
+    && dnf clean all
 
-RUN dnf install -y glib2-devel.x86_64 libjpeg-turbo-devel libpng-devel
+############################
+# 2) Build ImageMagick & its libs
+############################
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
+ENV CFLAGS="-I/usr/local/include"
+ENV LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH:-}
+ENV MAGICK_CODER_MODULE_PATH=/usr/local/lib/ImageMagick-7.1.1/modules-Q16/coders
 
-ADD build /root/build
+COPY build/build_imagemagick.sh /root/build/build_imagemagick.sh
+RUN chmod +x /root/build/build_imagemagick.sh \
+    && /root/build/build_imagemagick.sh
 
-RUN /root/build/build_libjpeg.sh
-RUN /root/build/build_libpng.sh
-RUN /root/build/build_libwebp.sh
-RUN /root/build/build_libde265.sh
-RUN /root/build/build_libheif.sh
-RUN /root/build/build_libopenjp2.sh
-RUN /root/build/build_libtiff.sh
-RUN /root/build/build_libbz2.sh
-RUN /root/build/build_lcms.sh
-RUN /root/build/build_imagemagick.sh
+############################
+# 3) Copy only runtime .so’s & magick binary
+############################
+RUN find /usr/local/lib /usr/local/lib64 -type f -name "lib*.so*" \
+    -exec cp -v {} /lib64/ \; \
+    && mkdir -p /opt/bin \
+    && cp /usr/local/bin/magick /opt/bin/magick
 
+############################
+# 4) Sanity check         #
+############################
+RUN echo "Linked libs:" \
+    && ldd /opt/bin/magick \
+    && echo "Formats:" \
+    && /opt/bin/magick identify -list format
 
-COPY package.json ${LAMBDA_TASK_ROOT}
-COPY package-lock.json ${LAMBDA_TASK_ROOT}
-RUN cd ${LAMBDA_TASK_ROOT} && npm i
-COPY function.js ${LAMBDA_TASK_ROOT}
-
-# Update the paths to be in the right place
-RUN cp /usr/local/lib64/libde265.so* /lib64/ || true && \
-    cp /usr/local/lib64/libx265.so* /lib64/ || true
-RUN cp /usr/local/lib64/libheif.so* /lib64/
-
-RUN mkdir -p /opt/bin && \
-    cp /root/result/bin/magick /opt/bin/magick && \
-    if [ -x /opt/bin/magick ]; then \
-    echo "magick installed successfully at /opt/bin/magick"; \
-    else \
-    echo "magick binary not found or not executable at /opt/bin/magick"; \
-    exit 1; \
-    fi
-
-
-# Sanity check - can we run magick?
-RUN ldd /opt/bin/magick
-RUN find / -name 'libheif.so*' && /opt/bin/magick -version
+############################
+# 5) Copy Lambda code     #
+############################
+COPY package.json package-lock.json ${LAMBDA_TASK_ROOT}/
+RUN cd ${LAMBDA_TASK_ROOT} && npm ci
+COPY function.js ${LAMBDA_TASK_ROOT}/
 
 CMD [ "function.handler" ]
