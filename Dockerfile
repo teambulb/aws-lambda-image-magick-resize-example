@@ -124,4 +124,7 @@ RUN node -e "\
     }                                                   \
     console.log('✅  index.handler found');"
 
+ENV MAGICK_THREAD_LIMIT=3 \
+    OMP_NUM_THREADS=3
+
 CMD [ "function.handler" ]
