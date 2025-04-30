@@ -1,7 +1,27 @@
 # syntax=docker/dockerfile:1
 ###############################################################################
-# ❶  Build stage – compile ImageMagick with HEIC
+# Build stage – compile ImageMagick with HEIC
 ###############################################################################
+
+FROM public.ecr.aws/lambda/nodejs:22 AS nodebuilder
+WORKDIR /src
+
+# 1) install only the compiler — no dev deps go to the final image
+RUN npm install --global esbuild@0.20.0
+
+# 2) copy just your function + package.json so esbuild can follow requires
+COPY package.json .
+COPY function.js .
+COPY package-lock.json .
+
+RUN npm ci
+
+# 3) bundle & minify to a single file targeted at Node 22
+RUN esbuild function.js \
+    --bundle --platform=node --target=node22 \
+    --format=cjs --minify \
+    --outfile=/dist/function.js
+
 FROM public.ecr.aws/lambda/nodejs:22 AS builder
 
 RUN dnf install -y \
@@ -94,8 +114,14 @@ RUN set -e; \
 ###############################################################################
 # ❸  Your Lambda code
 ###############################################################################
-COPY package.json package-lock.json ${LAMBDA_TASK_ROOT}/
-RUN cd ${LAMBDA_TASK_ROOT} && npm ci --only=production
-COPY function.js ${LAMBDA_TASK_ROOT}/
+COPY --from=nodebuilder /dist/function.js ${LAMBDA_TASK_ROOT}/function.js
+RUN ls ${LAMBDA_TASK_ROOT}
+RUN node -e "\
+    const m = require('./function');                       \
+    if (typeof m.handler !== 'function') {              \
+    console.error('❌  index.handler not found');      \
+    process.exit(1);                                  \
+    }                                                   \
+    console.log('✅  index.handler found');"
 
 CMD [ "function.handler" ]
