@@ -1,130 +1,115 @@
 # syntax=docker/dockerfile:1
-###############################################################################
-# Build stage – compile ImageMagick with HEIC
-###############################################################################
 
-FROM public.ecr.aws/lambda/nodejs:22 AS nodebuilder
-WORKDIR /src
-
-# 1) install only the compiler — no dev deps go to the final image
-RUN npm install --global esbuild@0.20.0
-
-# 2) copy just your function + package.json so esbuild can follow requires
-COPY package.json .
-COPY function.js .
-COPY package-lock.json .
-
-RUN npm ci
-
-# 3) bundle & minify to a single file targeted at Node 22
-RUN esbuild function.js \
-    --bundle --platform=node --target=node22 \
-    --format=cjs --minify \
-    --outfile=/dist/function.js
-
+# Base image for AWS Lambda with Node.js 22
 FROM public.ecr.aws/lambda/nodejs:22 AS builder
 
-RUN dnf install -y \
-    git gcc gcc-c++ make cmake pkgconfig automake autoconf \
-    libtool libtool-ltdl-devel \
-    libjpeg-turbo-devel libpng-devel libwebp-devel \
-    openjpeg2-devel libtiff-devel lcms2-devel libxml2-devel \
-    zlib-devel xz xz-libs bzip2 bzip2-libs \
-    && dnf clean all
+# Update packages and install build dependencies
+RUN dnf update -y && \
+        dnf install -y gcc-c++ make cmake pkg-config git tar gzip \
+        libjpeg-turbo-devel libpng-devel libtiff-devel giflib-devel libwebp-devel && \
+        dnf clean all
 
-ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
-ENV CFLAGS="-I/usr/local/include"
-ENV LDFLAGS="-L/usr/local/lib64 -L/usr/local/lib"
+# Install libde265 and x265 dependencies for HEIC support
 
-COPY build/build_imagemagick.sh /root/build/build_imagemagick.sh
-RUN chmod +x /root/build/build_imagemagick.sh \
-    && /root/build/build_imagemagick.sh
+RUN git clone https://github.com/videolan/x265.git && \
+    cd x265/build/linux && \
+    cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX=/usr/local ../../source && \
+    make -j$(nproc) && \
+    make install && \
+    cd ../../.. && \
+    rm -rf x265 && \
+    dnf clean all
 
-# ── harvest runtime artefacts ────────────────────────────────────────────────
-RUN mkdir -p /runtime_root/bin /runtime_root/lib /runtime_root/etc \
-    && cp /usr/local/bin/magick                /runtime_root/bin/ \
-    && cp -r /usr/local/etc/ImageMagick-*      /runtime_root/etc/ \
-    && cp -r /usr/local/lib/ImageMagick-*      /runtime_root/lib/ \
-    && cp -v /usr/local/lib/*.so*              /runtime_root/lib/ \
-    && cp -v /usr/local/lib64/*.so*            /runtime_root/lib/ \
-    \
-    # 1️⃣  run ldd on magick + all coder modules; keep only fields that
-    #     (a) start with “/”  and  (b) contain “.so”  → guaranteed real paths
-    && { \
-    ldd /usr/local/bin/magick; \
-    find /usr/local/lib/ImageMagick-*/modules-Q16/coders -name '*.so' -exec ldd {} \; ; \
-    } \
-    | awk '{for(i=1;i<=NF;i++) if($i ~ /^\/.*\.so/) print $i}' \
-    | sort -u \
-    | xargs -I{} cp -v {} /runtime_root/lib/ \
-    \
-    # 2️⃣  pull in second-level deps of libheif (gets libx265, etc.)
-    && ldd /usr/local/lib64/libheif.so \
-    | awk '{for(i=1;i<=NF;i++) if($i ~ /^\/.*\.so/) print $i}' \
-    | sort -u \
-    | xargs -I{} cp -v {} /runtime_root/lib/ \
-    \
-    # 3️⃣  strip symbols (optional, saves a few MB)
-    && strip --strip-unneeded /runtime_root/lib/*.so* || true
+# Build libde265 from source (required for HEIC decoding)
+RUN curl -L https://github.com/strukturag/libde265/releases/download/v1.0.15/libde265-1.0.15.tar.gz -o libde265.tar.gz && \
+    tar -xzf libde265.tar.gz && \
+    cd libde265-1.0.15 && \
+    ./configure --prefix=/usr/local --disable-sherlock265 --disable-dec265 && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && \
+    rm -rf libde265* && \
+    dnf clean all
+
+# Install libheif from source for HEIC/HEIF support
+RUN curl -L https://github.com/strukturag/libheif/releases/download/v1.17.6/libheif-1.17.6.tar.gz -o libheif.tar.gz && \
+    tar -xzf libheif.tar.gz && \
+    cd libheif-1.17.6 && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release \
+          -DWITH_EXAMPLES=OFF \
+          -DWITH_DAV1D=OFF \
+          -DWITH_AOM=OFF \
+          -DWITH_RAV1E=OFF \
+          -DWITH_SvtEnc=OFF \
+          -DWITH_KVAZAAR=OFF \
+          -DWITH_OpenJPEG=OFF \
+          -DWITH_FFMPEG=OFF \
+          -DWITH_LIBSHARPYUV=OFF \
+          .. && \
+    make -j$(nproc) && \
+    make install && \
+    cd ../.. && \
+    rm -rf libheif* && \
+    dnf clean all
+
+# Set the working directory
+WORKDIR /var/task
+
+# Copy package files
+COPY package.json package-lock.json ./
+
+# Install Node.js dependencies
+RUN npm ci --omit=dev
+
+# Rebuild Sharp for Lambda environment with HEIC support
+RUN npm rebuild sharp --platform=linux --arch=x64
+
+# Copy the source code
+COPY src/ ./src/
 
 
-
-
-RUN ldd /usr/local/bin/magick | awk '/=>/ {print $(NF-1)}' | \
-    while read f; do test -e "/runtime_root/lib/$(basename $f)" || \
-    { echo "Missing $f"; exit 1; }; done
-
-###############################################################################
-# ❷  Runtime stage – minimal Lambda image
-###############################################################################
+#############################
+# Stage 2: Runtime only     #
+#############################
 FROM public.ecr.aws/lambda/nodejs:22
 
-COPY --from=builder /runtime_root/bin/ /opt/bin/
-COPY --from=builder /runtime_root/lib/ /opt/lib/
-COPY --from=builder /runtime_root/etc/ /opt/etc/
+# Create working dir
+WORKDIR /var/task
 
-# ➜ create a stable symlink so the path never contains wildcards
-RUN ln -s $(ls -d /opt/lib/ImageMagick-* | head -n1) /opt/lib/ImageMagick  \
-    && echo "Symlink created → $(readlink -f /opt/lib/ImageMagick)"
+# Copy node_modules and app code from builder
+COPY --from=builder /var/task /var/task
 
-ENV LD_LIBRARY_PATH=/opt/lib \
-    MAGICK_HOME=/opt \
-    MAGICK_CONFIGURE_PATH=/opt/etc \
-    MAGICK_CODER_MODULE_PATH=/opt/lib/ImageMagick/modules-Q16/coders
+# Copy only necessary shared libraries
+COPY --from=builder /usr/local /usr/local
 
-RUN POLICY_FILE=$(ls /opt/etc/ImageMagick-*/policy.xml | head -n1) && \
-    # 1) if a HEIC line exists with rights="none", flip it to read|write
-    if grep -q 'pattern="HEIC"' "$POLICY_FILE"; then \
-    sed -i 's/\(pattern="HEIC"[[:space:]]*rights=\)"none"/\1"read|write"/' "$POLICY_FILE"; \
-    else \
-    # 2) otherwise inject a permissive rule at the top of <policymap>
-    sed -i '0,/<policymap>/a\  <policy domain="coder" rights="read|write" pattern="HEIC"/>' "$POLICY_FILE"; \
-    fi
+# Reduce size - remove headers, docs, dev artifacts
+RUN rm -rf /usr/local/include /usr/local/share /usr/local/lib/pkgconfig \
+           /usr/local/lib/cmake /usr/local/lib/*.a && \
+    strip --strip-unneeded /usr/local/lib/*.so* || true
 
-# sanity-check
-RUN set -e; \
-    required="JPG BMP GIF PNG WEBP TIFF HEIC"; \
-    have="$(/opt/bin/magick identify -list format \
-    | awk '{gsub(/[^A-Za-z]/, "", $1); print toupper($1)}')" ; \
-    for f in $required; do \
-    echo "$have" | grep -qx "$f" \
-    || { echo "❌  Missing format: $f" >&2; exit 1; } ; \
-    done && echo "✅  All required formats found"
+# Set library path
+ENV LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:/usr/lib64
 
-###############################################################################
-# ❸  Your Lambda code
-###############################################################################
-COPY --from=nodebuilder /dist/function.js ${LAMBDA_TASK_ROOT}/function.js
-RUN ls ${LAMBDA_TASK_ROOT}
-RUN node -e "\
-    const m = require('./function');                       \
-    if (typeof m.handler !== 'function') {              \
-    console.error('❌  index.handler not found');      \
-    process.exit(1);                                  \
-    }                                                   \
-    console.log('✅  index.handler found');"
+# Test if Sharp is properly installed with HEIC support
+RUN node -e "try { \
+    const sharp = require('sharp'); \
+    console.log('✅ Sharp installed successfully'); \
+    console.log('Sharp version:', sharp.versions); \
+    console.log('Supported formats:'); \
+    Object.entries(sharp.format).forEach(([format, details]) => { \
+        if (details.input && details.input.buffer) { \
+            console.log('  Input:', format); \
+        } \
+    }); \
+} catch(e) { \
+    console.error('❌ Sharp installation failed:', e.message); \
+    process.exit(1); \
+}"
 
-ENV MAGICK_THREAD_LIMIT=3 \
-    OMP_NUM_THREADS=3
+# Set environment variables for optimal performance
+ENV NODE_ENV=production \
+    UV_THREADPOOL_SIZE=64
 
-CMD [ "function.handler" ]
+# Lambda entry point
+CMD ["src/handler.handler"]
