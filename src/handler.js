@@ -16,7 +16,7 @@ const { Crop, Resize, Rotate } = require("./imageManipulation");
 
 // Global variables
 let currentRuntimeCounter; // Clear this interval when a response is sent.
-
+console.log("Lambda deployed successfully and starting...");
 /**
  * Lambda handler function
  * @param {Object} event - The Lambda event

@@ -23,7 +23,7 @@ This repository demonstrates how to use Sharp and libheif libraries for high-per
 2. Build the docker image:
 
    ```shell
-   docker build --platform linux/amd64 -t image-resizer .
+   Run build-docker.sh
    ```
 
 3. Deploy the Lambda function using the provided CloudFormation templates.
